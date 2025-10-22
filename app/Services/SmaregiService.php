@@ -2,173 +2,163 @@
 
 namespace App\Services;
 
+use Carbon\Carbon;
+use Illuminate\Http\Client\Factory as HttpFactory;
+use Illuminate\Http\Client\PendingRequest;
+use Illuminate\Http\Client\RequestException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
-use GuzzleHttp\Client;
-use GuzzleHttp\Exception\ClientException;
-use Carbon\Carbon;
+use Throwable;
 
 class SmaregiService
 {
-    private $client;
-    private $tokenUrl;
-    private $apiBase;
-    private $clientId;
-    private $clientSecret;
-    private $contractId;
+    private const SMAREGI_TOKENS_TABLE = 'smaregi_tokens';
+    private const SMAREGI_TRANSACTIONS_TABLE = 'smaregi_transactions';
 
-    public function __construct()
+    private HttpFactory $http;
+    private array $config;
+
+    public function __construct(HttpFactory $http)
     {
-        $this->client       = new Client(['timeout' => 20]);
-        $this->tokenUrl     = env('SMAREGI_TOKEN_URL');
-        $this->apiBase      = env('SMAREGI_POS_API_BASE');
-        $this->clientId     = env('SMAREGI_CLIENT_ID');
-        $this->clientSecret = env('SMAREGI_CLIENT_SECRET');
-        $this->contractId   = env('SMAREGI_CONTRACT_ID');
+        $this->http = $http;
+        $this->config = config('smaregi', []);
     }
 
     /** 🔑 トークン取得 */
-    public function fetchToken($userId)
+    public function fetchAndSaveToken(int $userId): string
     {
-        $response = $this->client->post($this->tokenUrl, [
-            'auth' => [$this->clientId, $this->clientSecret],
-            'form_params' => [
-                'grant_type' => 'client_credentials',
-                'scope'      => 'pos.staffs:read pos.transactions:read',
-            ],
-        ]);
-
-        $body = (string) $response->getBody();
-        $data = json_decode($body, true);
-        if (json_last_error() !== JSON_ERROR_NONE || !isset($data['access_token'])) {
-            Log::error('Failed to decode smaregi token response or access_token is missing.', ['response_body' => $body, 'json_error' => json_last_error_msg()]);
-            throw new \Exception('Failed to fetch Smaregi access token: Invalid response format.');
-        }
-
-        DB::table('smaregi_tokens')->updateOrInsert(
-            ['user_id' => $userId],
-            [
-                'access_token'            => $data['access_token'],
-                'expires_in'              => $data['expires_in'] ?? null,
-                'access_token_expires_at' => Carbon::now()->addSeconds($data['expires_in'] ?? 0),
-                'scope'                   => $data['scope'] ?? null,
-                'token_type'              => $data['token_type'] ?? null,
-                'updated_at'              => now(),
-            ]
-        );
-
-        return $data['access_token'];
-    }
-
-    /** 📡 API共通GETメソッド */
-    public function get($userId, $endpoint, $params = [])
-    {
-        $token = DB::table('smaregi_tokens')->where('user_id', $userId)->value('access_token');
-
         try {
-            return $this->requestWithToken('GET', $endpoint, $token, $params);
-        } catch (ClientException $e) {
-            // 401 → トークン再取得してリトライ
-            if ($e->getResponse() && $e->getResponse()->getStatusCode() === 401) {
-                $newToken = $this->fetchToken($userId);
-                return $this->requestWithToken('GET', $endpoint, $newToken, $params);
-            }
-            throw $e;
+            $response = $this->http->asForm()
+                ->withBasicAuth($this->config['client_id'], $this->config['client_secret'])
+                ->post($this->config['token_url'], [
+                    'grant_type' => 'client_credentials',
+                    'scope'      => 'pos.staffs:read pos.transactions:read pos.products:read', // 商品取得スコープも追加
+                ]);
+
+            $response->throw(); // 失敗したら例外をスロー
+
+            $data = $response->json();
+            $accessToken = $data['access_token'];
+
+            DB::table(self::SMAREGI_TOKENS_TABLE)->updateOrInsert(
+                ['user_id' => $userId],
+                [
+                    'access_token'            => $accessToken,
+                    'expires_in'              => $data['expires_in'] ?? null,
+                    'access_token_expires_at' => Carbon::now()->addSeconds($data['expires_in'] ?? 0),
+                    'scope'                   => $data['scope'] ?? null,
+                    'updated_at'              => now(),
+                ]
+            );
+
+            return $accessToken;
+        } catch (RequestException $e) {
+            Log::error('Failed to fetch Smaregi access token.', [
+                'status' => $e->response?->status(),
+                'response' => $e->response?->body(),
+            ]);
+            throw new \Exception('スマレジのアクセストークン取得に失敗しました。', $e->getCode(), $e);
         }
     }
 
-    /** 実際のAPIリクエスト処理 */
-    private function requestWithToken($method, $endpoint, $token, $params = [])
+    /**
+     * 認証済みAPIクライアントを生成
+     * @throws \Exception
+     */
+    private function createAuthenticatedClient(int $userId): PendingRequest
     {
-        // ✅ URLに contract_id を含める
-        $url = rtrim($this->apiBase, '/') . '/' . $this->contractId . $endpoint;
+        $token = DB::table(self::SMAREGI_TOKENS_TABLE)->where('user_id', $userId)->value('access_token');
 
-        $response = $this->client->request($method, $url, [
-            'headers' => [
-                'Authorization' => 'Bearer ' . $token,
-                'Accept'        => 'application/json',
-            ],
-            'query' => $params,
-        ]);
-
-        $body = (string) $response->getBody();
-        $data = json_decode($body, true);
-
-        if (json_last_error() !== JSON_ERROR_NONE) {
-            Log::error('Smaregi API JSON decode error', ['endpoint' => $endpoint, 'response_body' => $body, 'json_error' => json_last_error_msg()]);
-            throw new \Exception('Smaregi API returned invalid JSON.');
+        if (!$token) {
+            $token = $this->fetchAndSaveToken($userId);
         }
-        return $data;
+
+        return $this->http
+            ->baseUrl(rtrim($this->config['pos_api_base'], '/') . '/' . $this->config['contract_id'])
+            ->withToken($token)
+            ->acceptJson()
+            ->timeout(30)
+            // 401エラーの場合、トークンを再取得して1回だけリトライ
+            ->retry(1, 0, function ($exception, $request) use ($userId) {
+                if ($exception instanceof RequestException && $exception->response->status() === 401) {
+                    Log::info('Smaregi token expired. Retrying with new token.');
+                    $newToken = $this->fetchAndSaveToken($userId);
+                    $request->withToken($newToken);
+                    return true; // リトライ実行
+                }
+                return false; // リトライしない
+            });
     }
 
     /** 👥 スタッフ一覧取得 */
-    public function getStaffs($userId)
+    public function getStaffs(int $userId): array
     {
-        $endpoint = '/pos/staffs';
-        return $this->get($userId, $endpoint);
+        $response = $this->createAuthenticatedClient($userId)->get('/pos/staffs');
+        $response->throw();
+        // スタッフAPIはレスポンスが 'data' キーでラップされている場合がある
+        return $response->json('data') ?? $response->json();
     }
 
-    /** 💰 取引データ取得（スマレジ仕様準拠） */
-    public function fetchTransactions($userId, $days = 30, $limit = 100)
+    /** 💰 取引データ取得 */
+    public function fetchTransactions(int $userId, int $days = 30, int $limit = 100): array
     {
-        // 📆 スマレジAPIの仕様に合わせ、日時フォーマットをISO 8601形式に変更
-        $to   = now()->toIso8601String();
-        $from = now()->subDays($days)->toIso8601String();
-
-        $endpoint = '/pos/transactions';
-        $params   = [
-            'transaction_date_time-from' => $from,
-            'transaction_date_time-to'   => $to,
+        $params = [
+            'transaction_date_time-from' => now()->subDays($days)->toIso8601String(),
+            'transaction_date_time-to'   => now()->toIso8601String(),
             'limit'                      => $limit,
+            'with_details'               => 'all', // 取引明細も同時に取得
         ];
 
         try {
-            $response = $this->get($userId, $endpoint, $params);
-        } catch (\GuzzleHttp\Exception\ClientException $e) {
+            $response = $this->createAuthenticatedClient($userId)->get('/pos/transactions', $params);
+            $response->throw();
+            return $response->json();
+        } catch (RequestException $e) {
             Log::error('Smaregi Transactions API Error', [
-                'status' => $e->getResponse()->getStatusCode(),
-                'body'   => (string)$e->getResponse()->getBody(),
+                'status' => $e->response?->status(),
+                'body'   => $e->response?->body(),
             ]);
             throw $e;
         }
-
-        // ✅ レスポンスデータ整形
-        // 取引APIのレスポンスは配列が直接返ってくることを期待する。
-        // もしAPIがエラーオブジェクト（例: {"code": "...", "message": "..."}）を返した場合、
-        // PHPでは連想配列として解釈されるため、is_array($response) は true になる。
-        // そのため、配列であり、かつエラーを示すキー（例: 'code', 'error'）が含まれていないことを確認する。
-        if (!is_array($response) || (isset($response['code']) && isset($response['message'])) || (isset($response['error']))) {
-            // APIがエラーオブジェクトを返した場合、または期待される配列形式でない場合
-            Log::error('Smaregi Transactions API invalid response format or API error.', ['response' => $response]);
-            // エラーメッセージにAPIからのレスポンスを含めることで、原因特定に役立てる
-            throw new \Exception('Smaregi API returned an unexpected response format or an error: ' . json_encode($response, JSON_UNESCAPED_UNICODE));
-        }
-
-        $transactions = $response;
-        Log::info('Smaregi Transactions Fetched', ['count' => count($transactions)]);
-
-        // 💾 DB保存処理
-        foreach ($transactions as $tx) {
-            // 必須のIDがないデータはスキップ
-            if (!isset($tx['transactionHeadId'])) {
-                continue;
-            }
-            DB::table('smaregi_transactions')->updateOrInsert(
-                ['transaction_head_id' => $tx['transactionHeadId']],
-                [
-                    'customer_name'    => $tx['customerName'] ?? null,
-                    'staff_name'       => $tx['staffName'] ?? null,
-                    'total_amount'     => $tx['totalAmount'] ?? null,
-                    'payment_type'     => $tx['paymentType'] ?? null,
-                    'transaction_date' => isset($tx['transactionDateTime']) ? Carbon::parse($tx['transactionDateTime']) : null,
-                    'raw_data'         => json_encode($tx, JSON_UNESCAPED_UNICODE),
-                    'updated_at'       => now(),
-                ]
-            );
-        }
-
-        return count($transactions);
     }
 
+    /**
+     * 取得した取引データをステージングテーブルに保存する
+     * @param array $transactions
+     * @return int 保存した件数
+     */
+    public function storeTransactionsToStaging(array $transactions): int
+    {
+        $storedCount = 0;
+        foreach ($transactions as $tx) {
+            if (!is_array($tx) || !isset($tx['transactionHeadId'])) {
+                continue;
+            }
 
+            try {
+                DB::table(self::SMAREGI_TRANSACTIONS_TABLE)->updateOrInsert(
+                    ['transaction_head_id' => $tx['transactionHeadId']],
+                    [
+                        'customer_name'    => $tx['customerName'] ?? null,
+                        'staff_name'       => $tx['staffName'] ?? null,
+                        'total_amount'     => $tx['totalAmount'] ?? null,
+                        'payment_type'     => $tx['details'][0]['paymentMethod'] ?? null, // 簡易的に最初の支払方法を取得
+                        'transaction_date' => isset($tx['transactionDateTime']) ? Carbon::parse($tx['transactionDateTime']) : null,
+                        'raw_data'         => json_encode($tx, JSON_UNESCAPED_UNICODE),
+                        'created_at'       => now(),
+                        'updated_at'       => now(),
+                    ]
+                );
+                $storedCount++;
+            } catch (Throwable $e) {
+                Log::error('Failed to store transaction to staging table.', [
+                    'transactionHeadId' => $tx['transactionHeadId'] ?? 'N/A',
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        Log::info('Smaregi Transactions Stored', ['count' => $storedCount]);
+        return $storedCount;
+    }
 }

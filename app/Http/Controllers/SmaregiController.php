@@ -24,7 +24,7 @@ class SmaregiController extends Controller
             $userId = Auth::id();
 
             // トークン取得
-            $accessToken = $this->smaregiService->fetchToken($userId);
+            $accessToken = $this->smaregiService->fetchAndSaveToken($userId);
 
             Log::info('Smaregi token fetched successfully', ['token' => $accessToken]);
 
@@ -67,7 +67,12 @@ class SmaregiController extends Controller
     {
         try {
             $userId = Auth::id();
-            $count  = $this->smaregiService->fetchTransactions($userId);
+            // 1. APIから取引データを取得
+            $transactions = $this->smaregiService->fetchTransactions($userId);
+            // 2. 取得したデータをDBに保存
+            $count = $this->smaregiService->storeTransactionsToStaging($transactions);
+
+            // TODO: ここで取得したデータを正規化するジョブをディスパッチする
 
             return redirect()->route('dashboard')->with('status', "取引データを {$count} 件取得しました。");
         } catch (\Exception $e) {
