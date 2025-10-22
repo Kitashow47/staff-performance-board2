@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\ClientException;
 use Carbon\Carbon;
@@ -37,7 +38,12 @@ class SmaregiService
             ],
         ]);
 
-        $data = json_decode($response->getBody(), true);
+        $body = (string) $response->getBody();
+        $data = json_decode($body, true);
+        if (json_last_error() !== JSON_ERROR_NONE || !isset($data['access_token'])) {
+            Log::error('Failed to decode smaregi token response or access_token is missing.', ['response_body' => $body, 'json_error' => json_last_error_msg()]);
+            throw new \Exception('Failed to fetch Smaregi access token: Invalid response format.');
+        }
 
         DB::table('smaregi_tokens')->updateOrInsert(
             ['user_id' => $userId],
@@ -85,7 +91,14 @@ class SmaregiService
             'query' => $params,
         ]);
 
-        return json_decode($response->getBody(), true);
+        $body = (string) $response->getBody();
+        $data = json_decode($body, true);
+
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            Log::error('Smaregi API JSON decode error', ['endpoint' => $endpoint, 'response_body' => $body, 'json_error' => json_last_error_msg()]);
+            throw new \Exception('Smaregi API returned invalid JSON.');
+        }
+        return $data;
     }
 
     /** 👥 スタッフ一覧取得 */
@@ -95,10 +108,67 @@ class SmaregiService
         return $this->get($userId, $endpoint);
     }
 
-    /** 💰 取引一覧取得（今後拡張予定） */
-    public function getTransactions($userId, $params = [])
+    /** 💰 取引データ取得（スマレジ仕様準拠） */
+    public function fetchTransactions($userId, $days = 30, $limit = 100)
     {
+        // 📆 スマレジAPIの仕様に合わせ、日時フォーマットをISO 8601形式に変更
+        $to   = now()->toIso8601String();
+        $from = now()->subDays($days)->toIso8601String();
+
         $endpoint = '/pos/transactions';
-        return $this->get($userId, $endpoint, $params);
+        $params   = [
+            'transaction_date_time-from' => $from,
+            'transaction_date_time-to'   => $to,
+            'limit'                      => $limit,
+        ];
+
+        try {
+            $response = $this->get($userId, $endpoint, $params);
+        } catch (\GuzzleHttp\Exception\ClientException $e) {
+            Log::error('Smaregi Transactions API Error', [
+                'status' => $e->getResponse()->getStatusCode(),
+                'body'   => (string)$e->getResponse()->getBody(),
+            ]);
+            throw $e;
+        }
+
+        // ✅ レスポンスデータ整形
+        // 取引APIのレスポンスは配列が直接返ってくることを期待する。
+        // もしAPIがエラーオブジェクト（例: {"code": "...", "message": "..."}）を返した場合、
+        // PHPでは連想配列として解釈されるため、is_array($response) は true になる。
+        // そのため、配列であり、かつエラーを示すキー（例: 'code', 'error'）が含まれていないことを確認する。
+        if (!is_array($response) || (isset($response['code']) && isset($response['message'])) || (isset($response['error']))) {
+            // APIがエラーオブジェクトを返した場合、または期待される配列形式でない場合
+            Log::error('Smaregi Transactions API invalid response format or API error.', ['response' => $response]);
+            // エラーメッセージにAPIからのレスポンスを含めることで、原因特定に役立てる
+            throw new \Exception('Smaregi API returned an unexpected response format or an error: ' . json_encode($response, JSON_UNESCAPED_UNICODE));
+        }
+
+        $transactions = $response;
+        Log::info('Smaregi Transactions Fetched', ['count' => count($transactions)]);
+
+        // 💾 DB保存処理
+        foreach ($transactions as $tx) {
+            // 必須のIDがないデータはスキップ
+            if (!isset($tx['transactionHeadId'])) {
+                continue;
+            }
+            DB::table('smaregi_transactions')->updateOrInsert(
+                ['transaction_head_id' => $tx['transactionHeadId']],
+                [
+                    'customer_name'    => $tx['customerName'] ?? null,
+                    'staff_name'       => $tx['staffName'] ?? null,
+                    'total_amount'     => $tx['totalAmount'] ?? null,
+                    'payment_type'     => $tx['paymentType'] ?? null,
+                    'transaction_date' => isset($tx['transactionDateTime']) ? Carbon::parse($tx['transactionDateTime']) : null,
+                    'raw_data'         => json_encode($tx, JSON_UNESCAPED_UNICODE),
+                    'updated_at'       => now(),
+                ]
+            );
+        }
+
+        return count($transactions);
     }
+
+
 }
