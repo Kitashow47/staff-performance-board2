@@ -44,20 +44,13 @@ class SmaregiController extends Controller
             // スマレジAPI呼び出し
             $staffs = $this->smaregiService->getStaffs($userId);
 
-            // デバッグ用ログ
             Log::info('Smaregi Staffs API Response', $staffs);
 
-            // 返却形式によって分岐
-            if (isset($staffs['data'])) {
-                $staffList = $staffs['data'];
-            } elseif (is_array($staffs)) {
-                $staffList = $staffs;
-            } else {
-                $staffList = [];
-            }
+            // レスポンスが 'data' キーでラップされている場合と、配列が直接返る場合の両方に対応
+            $staffList = $staffs['data'] ?? $staffs ?? [];
 
             // スタッフが空ならメッセージを表示
-            if (empty($staffList)) {
+            if (empty($staffList) || !is_array($staffList)) {
                 return view('staffs', ['staffs' => [], 'message' => 'スタッフデータが見つかりませんでした。']);
             }
 
@@ -74,12 +67,13 @@ class SmaregiController extends Controller
     {
         try {
             $userId = Auth::id();
-            $transactions = $this->smaregiService->getTransactions($userId);
+            $count  = $this->smaregiService->fetchTransactions($userId);
 
-            return view('transactions', ['transactions' => $transactions]);
+            return redirect()->route('dashboard')->with('status', "取引データを {$count} 件取得しました。");
         } catch (\Exception $e) {
             Log::error('Smaregi Transactions Error', ['message' => $e->getMessage()]);
-            return back()->with('error', '取引情報の取得に失敗しました。');
+            return redirect()->route('dashboard')->with('error', '取引データの取得に失敗しました。');
         }
     }
+
 }
