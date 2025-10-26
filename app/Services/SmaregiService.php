@@ -27,7 +27,7 @@ class SmaregiService
         $this->contractId   = env('SMAREGI_CONTRACT_ID');
     }
 
-    /** 🔑 トークン取得 */
+    /** 🔑 アクセストークン取得 */
     public function fetchToken($userId)
     {
         $response = $this->client->post($this->tokenUrl, [
@@ -38,14 +38,9 @@ class SmaregiService
             ],
         ]);
 
-        $body = (string) $response->getBody();
-        $data = json_decode($body, true);
-        if (json_last_error() !== JSON_ERROR_NONE || !isset($data['access_token'])) {
-            Log::error('Failed to decode smaregi token response or access_token is missing.', [
-                'response_body' => $body,
-                'json_error' => json_last_error_msg()
-            ]);
-            throw new \Exception('Failed to fetch Smaregi access token: Invalid response format.');
+        $data = json_decode((string)$response->getBody(), true);
+        if (!isset($data['access_token'])) {
+            throw new \Exception('Smaregi access token fetch failed.');
         }
 
         DB::table('smaregi_tokens')->updateOrInsert(
@@ -53,9 +48,7 @@ class SmaregiService
             [
                 'access_token'            => $data['access_token'],
                 'expires_in'              => $data['expires_in'] ?? null,
-                'access_token_expires_at' => Carbon::now()->addSeconds($data['expires_in'] ?? 0),
-                'scope'                   => $data['scope'] ?? null,
-                'token_type'              => $data['token_type'] ?? null,
+                'access_token_expires_at' => now()->addSeconds($data['expires_in'] ?? 0),
                 'updated_at'              => now(),
             ]
         );
@@ -63,7 +56,7 @@ class SmaregiService
         return $data['access_token'];
     }
 
-    /** 📡 API共通GETメソッド */
+    /** 📡 共通GETメソッド */
     public function get($userId, $endpoint, $params = [])
     {
         $token = DB::table('smaregi_tokens')->where('user_id', $userId)->value('access_token');
@@ -71,7 +64,8 @@ class SmaregiService
         try {
             return $this->requestWithToken('GET', $endpoint, $token, $params);
         } catch (ClientException $e) {
-            if ($e->getResponse() && $e->getResponse()->getStatusCode() === 401) {
+            // 401 の場合だけトークン更新して再試行
+            if ($e->getResponse()?->getStatusCode() === 401) {
                 $newToken = $this->fetchToken($userId);
                 return $this->requestWithToken('GET', $endpoint, $newToken, $params);
             }
@@ -79,96 +73,136 @@ class SmaregiService
         }
     }
 
-    /** 実際のAPIリクエスト処理 */
+    /** 実際のAPI呼び出し */
     private function requestWithToken($method, $endpoint, $token, $params = [])
     {
         $url = rtrim($this->apiBase, '/') . '/' . $this->contractId . $endpoint;
 
         $response = $this->client->request($method, $url, [
             'headers' => [
-                'Authorization' => 'Bearer ' . $token,
+                'Authorization' => 'Bearer '.$token,
                 'Accept'        => 'application/json',
             ],
             'query' => $params,
         ]);
 
-        $body = (string) $response->getBody();
-        $data = json_decode($body, true);
-
+        $data = json_decode((string)$response->getBody(), true);
         if (json_last_error() !== JSON_ERROR_NONE) {
-            Log::error('Smaregi API JSON decode error', [
-                'endpoint' => $endpoint,
-                'response_body' => $body,
-                'json_error' => json_last_error_msg()
-            ]);
             throw new \Exception('Smaregi API returned invalid JSON.');
         }
+
         return $data;
     }
 
-    /** 👥 スタッフ一覧取得 */
+    /** 👥 スタッフ一覧 */
     public function getStaffs($userId)
     {
-        $endpoint = '/pos/staffs';
-        return $this->get($userId, $endpoint);
+        return $this->get($userId, '/pos/staffs');
     }
 
-    /** 💰 取引データ取得（POS API準拠） */
-    public function fetchTransactions($userId, ?string $from = null, ?string $to = null, int $page = 1, int $limit = 100)
-    {
+    /**
+     * 💰 取引取得（with_details 安全対応版）
+     * 他ページ互換性維持のため、シグネチャはそのまま。
+     */
+    public function fetchTransactions(
+        $userId,
+        ?string $from = null,
+        ?string $to = null,
+        int $page = 1,
+        int $limit = 100,
+        bool $withDetails = false
+    ) {
         $endpoint = '/pos/transactions';
-
-        // ✅ ISO8601形式（スマレジ仕様）
         $params = [
             'transaction_date_time-from' => ($from ? Carbon::parse($from) : now()->subDays(30))->toIso8601String(),
             'transaction_date_time-to'   => ($to ? Carbon::parse($to) : now())->toIso8601String(),
             'limit'                      => $limit,
             'page'                       => $page,
-            'sort'                       => 'updDateTime', // 降順指定は不可
+            'sort'                       => 'updDateTime',
+            'with_details'               => $withDetails ? 'all' : 'none',
         ];
 
         try {
             $response = $this->get($userId, $endpoint, $params);
         } catch (ClientException $e) {
-            Log::error('Smaregi Transactions API Error', [
-                'status' => $e->getResponse()?->getStatusCode(),
-                'body'   => (string)$e->getResponse()?->getBody(),
-            ]);
-            throw $e;
+            $body = (string)$e->getResponse()?->getBody();
+
+            // サンドボックス等で all が禁止される場合は none で自動リトライ
+            if (str_contains($body, 'with_details') && str_contains($body, 'none以外')) {
+                Log::warning('[SmaregiService] with_details=all が禁止 → none にフォールバックして再試行');
+                $params['with_details'] = 'none';
+                try {
+                    $response = $this->get($userId, $endpoint, $params);
+                } catch (\Throwable $e2) {
+                    Log::error('[SmaregiService] フォールバック後も失敗', ['error' => $e2->getMessage()]);
+                    return [];
+                }
+            } else {
+                Log::error('Smaregi Transactions API Error', [
+                    'status' => $e->getResponse()?->getStatusCode(),
+                    'body'   => $body,
+                ]);
+                // ここで再throwせず安全終了（他ページ影響なし）
+                return [];
+            }
         }
 
-        // ✅ スマレジの複数件取得APIはトップレベル配列で返却
-        if (isset($response['items'])) {
-            $transactions = $response['items'];
-        } elseif (is_array($response) && isset($response[0]['transactionHeadId'])) {
-            $transactions = $response;
-        } else {
-            Log::error('Smaregi Transactions API invalid response format.', ['response' => $response]);
-            throw new \Exception('Smaregi API returned an unexpected response format: ' . json_encode($response, JSON_UNESCAPED_UNICODE));
+        // レスポンス構造を吸収
+        $transactions = $response['items'] ?? (is_array($response) ? $response : []);
+        if (!is_array($transactions)) {
+            Log::error('Smaregi invalid response format', ['response' => $response]);
+            return [];
         }
 
-        // ✅ Laravel側で降順ソート
+        // 降順ソート（UI側の期待に合わせる）
         $transactions = collect($transactions)
             ->sortByDesc('updDateTime')
             ->values()
             ->all();
 
-        // 💾 DB保存処理
+        /**
+         * ✅ DB保存：details 付きの既存 raw_data がある場合は、
+         * details を含まない新データでは上書きしない（安全・非破壊）
+         */
         foreach ($transactions as $tx) {
             if (!isset($tx['transactionHeadId'])) {
                 continue;
             }
+
+            // 既存 raw_data の details 有無を確認
+            $existingRaw = DB::table('smaregi_transactions')
+                ->where('transaction_head_id', $tx['transactionHeadId'])
+                ->value('raw_data');
+
+            $existing = $existingRaw ? json_decode($existingRaw, true) : null;
+            $hasExistingDetails = isset($existing['details']) && is_array($existing['details']) && count($existing['details']) > 0;
+
+            $hasNewDetails = isset($tx['details']) && is_array($tx['details']) && count($tx['details']) > 0;
+
+            // 既存に details があり、新データに details がない時は raw_data を上書きしない
+            $rawDataToSave = $existingRaw;
+            if ($hasNewDetails || !$hasExistingDetails) {
+                // 新に details がある、または既存に details が無い → 新データで保存
+                $rawDataToSave = json_encode($tx, JSON_UNESCAPED_UNICODE);
+            } else {
+                // 既存 details を保持
+                Log::info('[SmaregiService] details なしのため既存 raw_data を保持', [
+                    'transactionHeadId' => $tx['transactionHeadId'],
+                ]);
+            }
+
             DB::table('smaregi_transactions')->updateOrInsert(
                 ['transaction_head_id' => $tx['transactionHeadId']],
                 [
-                    'customer_name'    => $tx['customerName'] ?? null,
-                    'staff_name'       => $tx['staffName'] ?? null,
-                    'total_amount'     => $tx['total'] ?? null,
-                    'payment_type'     => $tx['creditDivision'] ?? null,
+                    'customer_name'    => $tx['customerName'] ?? ($existing['customerName'] ?? null),
+                    'staff_name'       => $tx['staffName'] ?? ($existing['staffName'] ?? null),
+                    'staff_id'         => $tx['staffId'] ?? ($existing['staffId'] ?? null),
+                    'total_amount'     => $tx['total'] ?? ($existing['total'] ?? null),
+                    'payment_type'     => $tx['creditDivision'] ?? ($existing['creditDivision'] ?? null),
                     'transaction_date' => isset($tx['transactionDateTime'])
                         ? Carbon::parse($tx['transactionDateTime'])
-                        : null,
-                    'raw_data'         => json_encode($tx, JSON_UNESCAPED_UNICODE),
+                        : (isset($existing['transactionDateTime']) ? Carbon::parse($existing['transactionDateTime']) : null),
+                    'raw_data'         => $rawDataToSave,
                     'updated_at'       => now(),
                 ]
             );

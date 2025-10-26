@@ -65,7 +65,12 @@ class StaffRanking extends Component
                 ($tx['cashierStaffId'] ?? null) ??
                 null;
 
-            $staffKey = $staffId ? (string)$staffId : 'unknown';
+            // staffIdが存在しない場合はスキップ（null対応）
+            if (empty($staffId)) {
+                $staffKey = 'unknown';
+            } else {
+                $staffKey = (string)$staffId;
+            }
 
             $amount =
                 ($tx['totalAmount'] ?? null) ??
@@ -84,6 +89,7 @@ class StaffRanking extends Component
                     : ($tx['staffName'] ?? ($tx['staff']['name'] ?? '不明'));
 
                 $agg[$staffKey] = [
+                    'id'        => $staffId ?? 0, // ← ここを追加！
                     'staffId'   => $staffId,
                     'name'      => $name ?: '不明',
                     'amount'    => 0,
@@ -94,6 +100,7 @@ class StaffRanking extends Component
             $agg[$staffKey]['amount'] += $amount;
             $agg[$staffKey]['count']  += 1;
 
+            // デバッグ用ログ（最初の5件のみ）
             if ($i < 5) {
                 Log::info('[StaffRanking] TX sample', [
                     'staffId' => $staffId,
@@ -113,7 +120,6 @@ class StaffRanking extends Component
     public function render()
     {
         return view('livewire.pages.staff-ranking')
-            ->layout('layouts.app'); // ← これを戻す
+            ->layout('layouts.app');
     }
-
 }
