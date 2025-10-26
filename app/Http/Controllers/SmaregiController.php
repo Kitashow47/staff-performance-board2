@@ -46,15 +46,13 @@ class SmaregiController extends Controller
 
             Log::info('Smaregi Staffs API Response', $staffs);
 
-            // レスポンスが 'data' キーでラップされている場合と、配列が直接返る場合の両方に対応
-            $staffList = $staffs['data'] ?? $staffs ?? [];
+            // 'data'キーがある場合と配列直返しの両方に対応
+            $staffList = $staffs['data'] ?? (is_array($staffs) ? $staffs : []);
 
-            // スタッフが空ならメッセージを表示
-            if (empty($staffList) || !is_array($staffList)) {
+            if (empty($staffList)) {
                 return view('staffs', ['staffs' => [], 'message' => 'スタッフデータが見つかりませんでした。']);
             }
 
-            // ビューへデータ送信
             return view('staffs', ['staffs' => $staffList]);
         } catch (\Exception $e) {
             Log::error('Smaregi Staffs Error', ['message' => $e->getMessage()]);
@@ -62,12 +60,17 @@ class SmaregiController extends Controller
         }
     }
 
-    /** 💰 取引データ取得（今後拡張予定） */
+    /** 💰 取引データ取得 */
     public function transactions()
     {
         try {
-            $userId = Auth::id();
-            $count  = $this->smaregiService->fetchTransactions($userId);
+            $userId   = Auth::id();
+            $response = $this->smaregiService->fetchTransactions($userId, null, null, 1, 100);
+
+            // ✅ 修正版：itemsキーの有無に関係なく件数カウント
+            $count = is_array($response) ? count($response) : 0;
+
+            Log::info('Smaregi Transactions fetched', ['count' => $count]);
 
             return redirect()->route('dashboard')->with('status', "取引データを {$count} 件取得しました。");
         } catch (\Exception $e) {
@@ -75,5 +78,4 @@ class SmaregiController extends Controller
             return redirect()->route('dashboard')->with('error', '取引データの取得に失敗しました。');
         }
     }
-
 }

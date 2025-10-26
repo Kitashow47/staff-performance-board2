@@ -2,6 +2,7 @@
 
 use App\Http\Controllers\SmaregiController;
 use Illuminate\Support\Facades\Route;
+use App\Livewire\StaffRanking; // ← ✅ ここがポイント！パスが違います
 
 // ログイン後のみアクセス可能
 Route::middleware(['auth'])->group(function () {
@@ -14,6 +15,11 @@ Route::middleware(['auth'])->group(function () {
     Route::get('/smaregi/connect', [SmaregiController::class, 'connect'])->name('smaregi.connect');
     Route::get('/smaregi/staffs', [SmaregiController::class, 'staffs'])->name('smaregi.staffs');
     Route::get('/smaregi/transactions', [SmaregiController::class, 'transactions'])->name('smaregi.transactions');
+
+    // ✅ Livewire v3 対応：スタッフランキング
+    Route::get('/ranking', StaffRanking::class)
+        ->middleware('auth')
+        ->name('ranking');
 });
 
 // ✅ 認証機能（ログイン・ログアウト）

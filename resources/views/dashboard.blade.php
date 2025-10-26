@@ -13,7 +13,7 @@
             <div class="bg-red-100 text-red-800 p-3 mb-4 rounded">{{ session('error') }}</div>
         @endif
 
-        <div class="bg-white dark:bg-gray-800 p-6 rounded shadow">
+        <div class="bg-gray-800 text-white p-6 rounded-lg shadow">
             <p class="mb-4">スマレジと連携してデータを取得します。</p>
 
             {{-- スマレジ連携ボタン --}}
